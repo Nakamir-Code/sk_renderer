@@ -3,9 +3,75 @@
 micro_ply.h
 	Written by Nick Klingensmith, @koujaku on Twitter, @maluoi on GitHub
 
-	C-adapted version for sk_renderer.
+	This is a small ASCII and binary little-endian .ply loader and converter.
+	It's intended to be as short as possible, while still being easily
+	readable! The idea is that it can be trivially embedded in another single
+	header library or single file project without too much trouble. It
+	compiles as both C and C++.
 
-	This is a small ASCII/binary .ply loader and converter.
+Example usage:
+
+	// micro_ply.h follows stb library conventions, so MICRO_PLY_IMPL must
+	// be defined before include in only one file in your project!
+	#define MICRO_PLY_IMPL
+	#include "micro_ply.h"
+
+	// This is the vertex layout we'll be converting the PLY to.
+	typedef struct skg_vert_t {
+		float   pos [3];
+		float   norm[3];
+		float   uv  [2];
+		uint8_t col [4];
+	} skg_vert_t;
+
+	// Read the data from file, that's still on you, sorry :)
+	FILE *fp = fopen(filename, "rb");
+	if (fp == NULL) return false;
+	fseek(fp, 0L, SEEK_END);
+	size_t size = ftell(fp);
+	rewind(fp);
+	void *data = malloc(size);
+	fread (data, size, 1, fp);
+	fclose(fp);
+
+	// Parse the data using ply_read
+	ply_file_t file;
+	if (!ply_read(data, size, &file))
+		return false;
+
+	// Describe the way the contents of the PLY file map to our own vertex
+	// format. If the property can't be found in the file, the default value
+	// will be assigned. A NULL default leaves that memory untouched.
+	float     fzero = 0;
+	uint8_t   white = 255;
+	ply_map_t map_verts[] = {
+		{ PLY_PROP_POSITION_X,  ply_prop_decimal, sizeof(float), 0,  &fzero },
+		{ PLY_PROP_POSITION_Y,  ply_prop_decimal, sizeof(float), 4,  &fzero },
+		{ PLY_PROP_POSITION_Z,  ply_prop_decimal, sizeof(float), 8,  &fzero },
+		{ PLY_PROP_NORMAL_X,    ply_prop_decimal, sizeof(float), 12, &fzero },
+		{ PLY_PROP_NORMAL_Y,    ply_prop_decimal, sizeof(float), 16, &fzero },
+		{ PLY_PROP_NORMAL_Z,    ply_prop_decimal, sizeof(float), 20, &fzero },
+		{ PLY_PROP_TEXCOORD_X,  ply_prop_decimal, sizeof(float), 24, &fzero },
+		{ PLY_PROP_TEXCOORD_Y,  ply_prop_decimal, sizeof(float), 28, &fzero },
+		{ PLY_PROP_COLOR_R,     ply_prop_uint,    sizeof(uint8_t), 32, &white },
+		{ PLY_PROP_COLOR_G,     ply_prop_uint,    sizeof(uint8_t), 33, &white },
+		{ PLY_PROP_COLOR_B,     ply_prop_uint,    sizeof(uint8_t), 34, &white },
+		{ PLY_PROP_COLOR_A,     ply_prop_uint,    sizeof(uint8_t), 35, &white }, };
+	ply_convert(&file, PLY_ELEMENT_VERTICES, map_verts, sizeof(map_verts)/sizeof(map_verts[0]), sizeof(skg_vert_t), (void **)out_verts, out_vert_count);
+
+	// Properties defined as lists in the PLY format will get triangulated
+	// during conversion, so you don't need to worry about quads or n-gons in
+	// the geometry.
+	uint32_t  izero = 0;
+	ply_map_t map_inds[] = { { PLY_PROP_INDICES, ply_prop_uint, sizeof(uint32_t), 0, &izero } };
+	ply_convert(&file, PLY_ELEMENT_FACES, map_inds, sizeof(map_inds)/sizeof(map_inds[0]), sizeof(uint32_t), (void **)out_indices, out_ind_count);
+
+	// You gotta free the memory manually!
+	ply_free(&file);
+	free(data);
+
+	// Text decimals are parsed with atof, which honors LC_NUMERIC. Define
+	// MICRO_PLY_ATOF(str) before including to use your own parser instead.
 */
 
 #pragma once
@@ -85,6 +151,11 @@ void ply_convert(const ply_file_t *file, const char *element_name, const ply_map
 
 #ifdef MICRO_PLY_IMPL
 
+// atof honors LC_NUMERIC, so define this to swap in a locale-independent parser
+#ifndef MICRO_PLY_ATOF
+#define MICRO_PLY_ATOF(str) atof(str)
+#endif
+
 ///////////////////////////////////////////
 
 typedef enum ply_fmt_ {
@@ -96,39 +167,39 @@ typedef enum ply_fmt_ {
 ///////////////////////////////////////////
 
 static void _ply_convert(uint8_t *dest, uint8_t dest_size, uint8_t dest_type, const uint8_t *src, uint8_t src_size, uint8_t src_type) {
-	if (dest_size == src_size && src_type == dest_type) memcpy(dest, src, dest_size);
-	else if (src_type == ply_prop_decimal) {
-		double val = src_size == 4
-			? *(float  *)src
-			: *(double *)src;
-		if (dest_size == 4) *(float  *)dest = (float)val;
-		else                *(double *)dest = val;
+	if (dest_size == src_size && src_type == dest_type) { memcpy(dest, src, dest_size); return; }
+
+	// memcpy rather than pointer casts, binary file data isn't aligned
+	double  dval = 0;
+	int64_t ival = 0;
+	if (src_type == ply_prop_decimal) {
+		if (src_size == 4) { float f; memcpy(&f, src, 4); dval = f; }
+		else               { memcpy(&dval, src, 8); }
+	} else if (src_type == ply_prop_int) {
+		switch (src_size) {
+		case 1: { int8_t   v; memcpy(&v, src, 1); ival = v; } break;
+		case 2: { int16_t  v; memcpy(&v, src, 2); ival = v; } break;
+		case 4: { int32_t  v; memcpy(&v, src, 4); ival = v; } break;
+		case 8: { int64_t  v; memcpy(&v, src, 8); ival = v; } break; }
 	} else {
-		int64_t val=0;
-		if (src_type == ply_prop_int) {
-			switch (src_size) {
-			case 1: val = *(int8_t  *)src; break;
-			case 2: val = *(int16_t *)src; break;
-			case 4: val = *(int32_t *)src; break;
-			case 8: val = *(int64_t *)src; break;}
-		} else {
-			switch (src_size) {
-			case 1: val = *(uint8_t  *)src; break;
-			case 2: val = *(uint16_t *)src; break;
-			case 4: val = *(uint32_t *)src; break;
-			case 8: val = *(uint64_t *)src; break;}
-		}
-		if (dest_type == ply_prop_int) {
-			switch (dest_size) {
-			case 1: *(int8_t  *)dest = (int8_t )val; break;
-			case 2: *(int16_t *)dest = (int16_t)val; break;
-			case 4: *(int32_t *)dest = (int32_t)val; break;}
-		} else {
-			switch (dest_size) {
-			case 1: *(uint8_t *)dest = (uint8_t )val; break;
-			case 2: *(uint16_t*)dest = (uint16_t)val; break;
-			case 4: *(uint32_t*)dest = (uint32_t)val; break;}
-		}
+		switch (src_size) {
+		case 1: { uint8_t  v; memcpy(&v, src, 1); ival = v; } break;
+		case 2: { uint16_t v; memcpy(&v, src, 2); ival = v; } break;
+		case 4: { uint32_t v; memcpy(&v, src, 4); ival = v; } break;
+		case 8: { uint64_t v; memcpy(&v, src, 8); ival = (int64_t)v; } break; }
+	}
+
+	if (dest_type == ply_prop_decimal) {
+		if (src_type != ply_prop_decimal) dval = (double)ival;
+		if (dest_size == 4) { float f = (float)dval; memcpy(dest, &f, 4); }
+		else                { memcpy(dest, &dval, 8); }
+	} else {
+		// int and uint truncate to the same bits, so only size matters
+		if (src_type == ply_prop_decimal) ival = (int64_t)dval;
+		switch (dest_size) {
+		case 1: { uint8_t  v = (uint8_t )ival; memcpy(dest, &v, 1); } break;
+		case 2: { uint16_t v = (uint16_t)ival; memcpy(dest, &v, 2); } break;
+		case 4: { uint32_t v = (uint32_t)ival; memcpy(dest, &v, 4); } break; }
 	}
 }
 
@@ -189,7 +260,8 @@ bool ply_read(const void *file_data, size_t data_size, ply_file_t *out_file) {
 			else if (strcmp(word, "binary_big_endian"   ) == 0) format = ply_fmt_binary_be;
 		} else if (_ply_starts_with(line, "comment ")) {
 		} else if (_ply_starts_with(line, "element ")) {
-			ply_element_t el = {0};
+			ply_element_t el;
+			memset(&el, 0, sizeof(el));
 			_ply_get_word(line + sizeof("element"), el.name, sizeof(el.name));
 			_ply_get_word(line + sizeof("element ") + strlen(el.name), word, sizeof(word));
 			el.count = atoi(word);
@@ -198,7 +270,8 @@ bool ply_read(const void *file_data, size_t data_size, ply_file_t *out_file) {
 			out_file->elements = (ply_element_t*)realloc(out_file->elements, sizeof(ply_element_t) * (out_file->count));
 			out_file->elements[out_file->count - 1] = el;
 		} else if (_ply_starts_with(line, "property ")) {
-			ply_prop_t     prop = {0};
+			ply_prop_t prop;
+			memset(&prop, 0, sizeof(prop));
 			_ply_get_word(line + sizeof("property"), word, sizeof(word));
 
 			if (strcmp(word, "list"  ) == 0) {
@@ -226,6 +299,11 @@ bool ply_read(const void *file_data, size_t data_size, ply_file_t *out_file) {
 			break;
 		}
 		line = strchr(line, '\n');
+	}
+
+	if (format == ply_fmt_binary_be) {
+		ply_free(out_file);
+		return false;
 	}
 
 	// Parse the data
@@ -256,9 +334,9 @@ bool ply_read(const void *file_data, size_t data_size, ply_file_t *out_file) {
 					for (int32_t c = 0; c < count; c++) {
 						_ply_get_word(line + off, word, sizeof(word));
 						off += strlen(word) + 1;
-						if      (p->type == ply_prop_uint)    { uint64_t val = atol(word); _ply_convert(list_data, p->list_bytes, p->list_type, (uint8_t*)&val, sizeof(uint64_t), ply_prop_uint   ); }
-						else if (p->type == ply_prop_decimal) { double   val = atof(word); _ply_convert(list_data, p->list_bytes, p->list_type, (uint8_t*)&val, sizeof(double  ), ply_prop_decimal); }
-						else                                  { int64_t  val = atol(word); _ply_convert(list_data, p->list_bytes, p->list_type, (uint8_t*)&val, sizeof(int64_t ), ply_prop_int    ); }
+						if      (p->list_type == ply_prop_uint)    { uint64_t val = atol(word); _ply_convert(list_data, p->list_bytes, p->list_type, (uint8_t*)&val, sizeof(uint64_t), ply_prop_uint   ); }
+						else if (p->list_type == ply_prop_decimal) { double   val = MICRO_PLY_ATOF(word); _ply_convert(list_data, p->list_bytes, p->list_type, (uint8_t*)&val, sizeof(double  ), ply_prop_decimal); }
+						else                                       { int64_t  val = atol(word); _ply_convert(list_data, p->list_bytes, p->list_type, (uint8_t*)&val, sizeof(int64_t ), ply_prop_int    ); }
 						list_data  += p->list_bytes;
 						list_count += 1;
 						if (list_count >= list_cap) {
@@ -280,11 +358,11 @@ bool ply_read(const void *file_data, size_t data_size, ply_file_t *out_file) {
 					data += p->bytes;
 
 					// Make sure we have room for the elements
-					if (list_count+count >= list_cap) {
-						size_t offset = list_data - (uint8_t*)el->list_data;
-						list_cap = (int32_t)(list_cap * 1.25f);
-						el->list_data = realloc(el->list_data, p->list_bytes * list_cap);
-						list_data = ((uint8_t*)el->list_data) + offset;
+					int32_t needed = list_count + count;
+					if (needed > list_cap) {
+						list_cap      = needed > list_cap * 2 ? needed : list_cap * 2;
+						el->list_data = realloc(el->list_data, (size_t)p->list_bytes * list_cap);
+						list_data     = (uint8_t*)el->list_data + (size_t)list_count * p->list_bytes;
 					}
 					// Copy the elements
 					memcpy(list_data, line, p->list_bytes * count);
@@ -301,7 +379,7 @@ bool ply_read(const void *file_data, size_t data_size, ply_file_t *out_file) {
 						const ply_prop_t* p = &el->properties[prop];
 						_ply_get_word(line + off, word, sizeof(word));
 						off += strlen(word) + 1;
-						if      (p->type == ply_prop_decimal) { double   val = atof(word); _ply_convert(data+p->offset, p->bytes, p->type, (uint8_t*)&val, sizeof(double  ), ply_prop_decimal); }
+						if      (p->type == ply_prop_decimal) { double   val = MICRO_PLY_ATOF(word); _ply_convert(data+p->offset, p->bytes, p->type, (uint8_t*)&val, sizeof(double  ), ply_prop_decimal); }
 						else if (p->type == ply_prop_int)     { int64_t  val = atol(word); _ply_convert(data+p->offset, p->bytes, p->type, (uint8_t*)&val, sizeof(int64_t ), ply_prop_int    ); }
 						else                                  { uint64_t val = atol(word); _ply_convert(data+p->offset, p->bytes, p->type, (uint8_t*)&val, sizeof(uint64_t), ply_prop_uint   ); }
 					}
